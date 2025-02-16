@@ -38,9 +38,10 @@ from mcdreforged.plugin.plugin_event import MCDRPluginEvents
 from mcdreforged.plugin.plugin_manager import PluginManager
 from mcdreforged.plugin.si.server_interface import ServerInterface
 from mcdreforged.preference.preference_manager import PreferenceManager
+from mcdreforged.translation.language_fallback_handler import LanguageFallbackHandler
 from mcdreforged.translation.translation_manager import TranslationManager
 from mcdreforged.translation.translator import Translator
-from mcdreforged.utils import file_utils, request_utils, misc_utils
+from mcdreforged.utils import file_utils, request_utils, collection_utils
 from mcdreforged.utils.exception import ServerStartError, IllegalStateError
 from mcdreforged.utils.types.message import MessageText
 
@@ -53,6 +54,7 @@ class _ReceiveDecodeError(ValueError):
 
 
 _ConfigLoadedCallback = Callable[[MCDReforgedConfig, bool], Any]
+_UNSET: Any = object()
 
 
 class MCDReforgedServer:
@@ -63,7 +65,6 @@ class MCDReforgedServer:
 		self.server_information: ServerInformation = ServerInformation()
 		self.process: Optional[Popen] = None
 		self.__flags = MCDReforgedFlag.NONE
-		self.__info_filter_holders: List[InfoFilterHolder] = []
 		self.__starting_server_lock = threading.Lock()  # to prevent multiple start_server() call
 		self.__no_server_start = args.no_server_start
 		self.__stop_lock = threading.Lock()  # to prevent multiple stop() call
@@ -224,7 +225,7 @@ class MCDReforgedServer:
 			self, translation_key: str,
 			*args,
 			_mcdr_tr_language: Optional[str] = None,
-			_mcdr_tr_fallback_language: Optional[str] = core_constant.DEFAULT_LANGUAGE,
+			_mcdr_tr_fallback_language: Optional[str] = _UNSET,
 			_mcdr_tr_allow_failure: bool = True,
 			**kwargs
 	) -> MessageText:
@@ -239,11 +240,18 @@ class MCDReforgedServer:
 		:param _mcdr_tr_allow_failure: If set to false, a KeyError will be risen if the translation key is not recognized
 		:param kwargs: The kwargs to be formatted
 		"""
+		if _mcdr_tr_fallback_language is _UNSET:
+			fallback_handler = LanguageFallbackHandler.auto()
+		elif _mcdr_tr_fallback_language is None:
+			fallback_handler = LanguageFallbackHandler.none()
+		else:
+			fallback_handler = LanguageFallbackHandler.specified(_mcdr_tr_fallback_language)
+
 		return self.translation_manager.translate(
 			translation_key, args, kwargs,
 			allow_failure=_mcdr_tr_allow_failure,
 			language=_mcdr_tr_language,
-			fallback_language=_mcdr_tr_fallback_language,
+			fallback_handler=fallback_handler,
 			plugin_translations=self.plugin_manager.registry_storage.translations
 		)
 
@@ -284,7 +292,7 @@ class MCDReforgedServer:
 				self.__decoding_method = [config.decoding or locale.getpreferredencoding()]
 			else:
 				self.__decoding_method = config.decoding.copy()
-			self.__decoding_method = misc_utils.unique_list(self.__decoding_method)
+			self.__decoding_method = collection_utils.unique_list(self.__decoding_method)
 			if log:
 				self.logger.info(self.__tr('on_config_changed.encoding_decoding_set', self.__encoding_method, ','.join(self.__decoding_method)))
 
@@ -303,13 +311,14 @@ class MCDReforgedServer:
 		self.logger.info(future.result().to_rtext(self, show_path=True))
 
 	def on_plugin_registry_changed(self):
-		self.__info_filter_holders.clear()
-
 		reg: 'PluginRegistryStorage' = self.plugin_manager.registry_storage
 		with self.command_manager.start_command_register() as command_register:
 			reg.export_commands(command_register)
 		reg.export_server_handler(self.server_handler_manager.set_plugin_provided_server_handler_holder)
-		reg.export_info_filters(self.__info_filter_holders.append)
+
+		info_filter_holders: List[InfoFilterHolder] = []
+		reg.export_info_filters(info_filter_holders.append)
+		self.reactor_manager.set_info_filters(info_filter_holders)
 
 	# ---------------------------
 	#      General Setters
@@ -616,15 +625,8 @@ class MCDReforgedServer:
 			if self.logger.should_log_debug(option=DebugOption.HANDLER):
 				self.logger.mdebug('Parsed text from server stdout: {}'.format(info), no_check=True)
 		self.server_handler_manager.detect_text(text)
-		info.attach_mcdr_server(self)
 
-		for ifh in self.__info_filter_holders:
-			if ifh.filter.filter_server_info(info) is False:
-				if self.logger.should_log_debug(option=DebugOption.HANDLER):
-					self.logger.debug('Server info is discarded by filter {} from {}'.format(ifh.filter, ifh.plugin))
-				break
-		else:  # all filter check ok
-			self.reactor_manager.put_info(info)
+		self.reactor_manager.put_info(info)
 
 	def __on_mcdr_start(self):
 		self.logger.info(self.__tr('on_mcdr_start.starting', core_constant.NAME, core_constant.VERSION))
@@ -674,15 +676,17 @@ class MCDReforgedServer:
 				self.plugin_manager.dispatch_event(MCDRPluginEvents.PLUGIN_UNLOADED, ())
 
 				def join_executor(executor: BackgroundThreadExecutor):
-					wait_sec = 10 if self.is_interrupt() else 600
+					wait_sec = 10 if self.is_interrupt() else 1800
 					for i in range(wait_sec):
 						executor.join(timeout=1)
 						if executor.get_thread().is_alive():
-							if (sec := i + 1) in [10, 30, 60, 120, 300, 600]:
-								self.logger.warning('Task executor is still alive after {} seconds, stack trace:'.format(sec))
+							if (sec := i + 1) in [10, 30, 60, 120, 300, 600, 1800]:
+								self.logger.warning('{} is still alive after {} seconds, stack trace:'.format(executor, sec))
 								if (ss := executor.get_thread_stack()) is not None:
-									for line in ss.format():
-										self.logger.warning(line)
+									for lines in ss.format():
+										for line in lines.splitlines():
+											if line:
+												self.logger.warning(line)
 						else:
 							break
 					else:
@@ -695,6 +699,9 @@ class MCDReforgedServer:
 				# to prevent "coroutine xxx was never awaited" from happening
 				self.async_task_executor.stop()
 				join_executor(self.async_task_executor)
+
+				self.watch_dog.stop()
+				join_executor(self.watch_dog)
 
 			self.console_handler.stop()
 			self.update_helper.stop()

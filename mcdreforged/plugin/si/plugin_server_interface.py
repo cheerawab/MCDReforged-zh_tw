@@ -380,10 +380,10 @@ class PluginServerInterface(ServerInterface):
 							log(self._tr('load_config_simple.key_missed', key, value))
 							needs_save = True
 
-				# remove unexpected keys
-				for key in list(result_config.keys()):
-					if key not in default_config:
-						result_config.pop(key)
+					# remove unexpected keys
+					for key in list(result_config.keys()):
+						if key not in default_config:
+							result_config.pop(key)
 
 		log(self._tr('load_config_simple.succeed'))
 		if needs_save:

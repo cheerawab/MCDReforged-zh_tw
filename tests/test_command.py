@@ -1,15 +1,17 @@
 import unittest
 from abc import ABC
 from enum import Enum
-from typing import Type
+from typing import Type, Any, TypeVar, Set
 
 from typing_extensions import override
 
 from mcdreforged.api.command import *
 from mcdreforged.api.types import CommandSource
-from mcdreforged.command.builder.nodes.basic import CallbackError
+from mcdreforged.command.builder.callback import CallbackError, DirectCallbackInvoker
 from mcdreforged.command.builder.nodes.special import CountingLiteral
 from mcdreforged.utils.types.message import MessageText
+
+_T = TypeVar('_T')
 
 
 class _TestCommandSource(CommandSource):
@@ -31,27 +33,29 @@ class CommandTestCase(ABC, unittest.TestCase):
 	#   callbacks
 	# -------------
 
-	def callback_hit(self, source, ctx):
+	def callback_hit(self, source: CommandSource, ctx: dict):
 		self.has_hit = True
 
-	def callback_dummy(self, source, ctx):
+	def callback_dummy(self, source: CommandSource, ctx: dict):
 		pass
 
-	def set_result_from_ctx(self, ctx, key):
+	def set_result_from_ctx(self, ctx: dict, key: str):
 		self.result = ctx[key]
 
-	def set_result(self, result):
+	def set_result(self, result: Any):
 		self.result = result
 
 	# ---------
 	#   utils
 	# ---------
 
-	def run_command(self, executor: Literal, command):
+	def run_command(self, executor: Literal, command: str):
 		self.has_hit = False
 		self.result = None
 		# noinspection PyTypeChecker
-		executor._entry_execute(None, command)
+		executions = executor._entry_execute(None, command)
+		for execution in executions:
+			execution.scheduled_callback.invoke(DirectCallbackInvoker())
 
 	def check_hit(self, value: bool):
 		self.assertEqual(self.has_hit, value)
@@ -60,15 +64,19 @@ class CommandTestCase(ABC, unittest.TestCase):
 		self.assertEqual(type(self.result), type(result))
 		self.assertEqual(self.result, result)
 
-	def run_command_and_check_result(self, executor, command, result):
+	def cast(self, typ: Type[_T], obj: Any) -> _T:
+		self.assertIsInstance(obj, typ)
+		return obj
+
+	def run_command_and_check_result(self, executor: Literal, command: str, result):
 		self.run_command(executor, command)
 		self.check_result(result)
 
-	def run_command_and_check_hit(self, executor, command, value: bool):
+	def run_command_and_check_hit(self, executor: Literal, command: str, value: bool):
 		self.run_command(executor, command)
 		self.check_hit(value)
 
-	def assert_raises_and_check_hit(self, value: bool, error, func, *args, **kwargs):
+	def assert_raises_and_check_hit(self, value: bool, error: Type[Exception], func, *args, **kwargs):
 		self.assertRaises(error, func, *args, **kwargs)
 		self.check_hit(value)
 
@@ -373,6 +381,7 @@ class CommandTreeTestCase(CommandTestCase):
 		self.run_command_and_check_hit(Literal('test').runs(func3), 'test', True)
 		self.run_command_and_check_hit(Literal('test').runs(_C().method), 'test', True)
 		try:
+			# noinspection PyTypeChecker
 			self.run_command(Literal('test').runs(func4), 'test')
 		except Exception as e:
 			self.assertIsInstance(e, CallbackError)
@@ -427,6 +436,23 @@ class CommandTreeTestCase(CommandTestCase):
 		self.run_command_and_check_result(root, 'test ping pong ping', (2, 1))
 		self.run_command_and_check_result(root, 'test pong pong pong', (None, 3))
 
+	def test_18_precondition(self):
+		whitelist: Set[str] = set()
+
+		root = (
+			Literal('a').
+			precondition(lambda: 'a' in whitelist).
+			then(Text('b').precondition(lambda: 'b' in whitelist).runs(self.callback_hit))
+		)
+
+		# Notes: precondition has no effect on root node for now
+		self.assertRaises(UnknownCommand, self.run_command, root, 'a')
+		self.assertRaises(UnknownArgument, self.run_command, root, 'a b')
+
+		whitelist.add('b')
+		self.assertRaises(UnknownCommand, self.run_command, root, 'a')
+		self.run_command_and_check_hit(root, 'a b', True)
+
 
 class SimpleCommandBuilderTestCase(CommandTestCase):
 	def test_1_basic(self):
@@ -439,7 +465,7 @@ class SimpleCommandBuilderTestCase(CommandTestCase):
 		child = nodes[0].get_children()[0]
 		self.assertIsInstance(child, Literal)
 		self.assertEqual(child.literals, {'bar'})
-		self.run_command_and_check_hit(nodes[0], 'foo bar', True)
+		self.run_command_and_check_hit(self.cast(Literal, nodes[0]), 'foo bar', True)
 
 	# noinspection PyUnresolvedReferences
 	def test_2_node_order(self):
@@ -535,7 +561,7 @@ class SimpleCommandBuilderTestCase(CommandTestCase):
 				def_ = builder.literal('a')
 			self.assertIsInstance(def_, NodeDefinition)
 			def_.requires(lambda n: False)
-			def_.on_error(RequirementNotMet, self.callback_hit)
+			def_.on_error(RequirementNotMet, lambda src, err, ctx: self.callback_hit(src, ctx))
 
 			nodes = builder.build()
 			self.assertEqual(1, len(nodes))
@@ -574,7 +600,7 @@ class SimpleCommandBuilderTestCase(CommandTestCase):
 		nodes = builder.build()
 		self.assertEqual(1, len(nodes))
 
-		node = nodes[0]
+		node = self.cast(Literal, nodes[0])
 		self.run_command_and_check_result(node, 'foo a', 'foobar_a')
 		self.run_command_and_check_result(node, 'foo b', 'foobar_bc')
 		self.run_command_and_check_result(node, 'foo c 123', 'foobar_bc')
@@ -592,7 +618,7 @@ class CommandToolsTestCase(CommandTestCase):
 		self.assertEqual(1, len(nodes))
 		self.assertRaises(RequirementNotMet, self.run_command, nodes[0], 'r a test')
 		self.check_hit(False)
-		self.run_command_and_check_hit(nodes[0], 'r b 123 test', True)
+		self.run_command_and_check_hit(self.cast(Literal, nodes[0]), 'r b 123 test', True)
 
 
 if __name__ == '__main__':

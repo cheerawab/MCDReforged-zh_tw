@@ -10,6 +10,7 @@ from ruamel.yaml import YAML
 
 from mcdreforged.constants import core_constant
 from mcdreforged.minecraft.rtext.text import RTextBase
+from mcdreforged.translation.language_fallback_handler import LanguageFallbackHandler
 from mcdreforged.utils import file_utils, translation_utils
 from mcdreforged.utils.types.message import TranslationStorage, MessageText
 
@@ -33,7 +34,7 @@ class TranslationManager:
 			language, _ = os.path.basename(file_path).rsplit('.', 1)
 			try:
 				with open(os.path.join(MCDR_LANGUAGE_DIRECTORY, file_path), encoding='utf8') as file_handler:
-					translations = dict(YAML().load(file_handler))
+					translations: dict = YAML(typ='safe').load(file_handler)
 				for key, text in translation_utils.unpack_nest_translation(translations).items():
 					self.translations[key][language] = text
 				self.available_languages.add(language)
@@ -52,7 +53,7 @@ class TranslationManager:
 			*,
 			allow_failure: bool,
 			language: Optional[str] = None,
-			fallback_language: Optional[str] = None,
+			fallback_handler: LanguageFallbackHandler,
 			plugin_translations: Optional[TranslationStorage] = None
 	) -> MessageText:
 		if language is None:
@@ -62,10 +63,10 @@ class TranslationManager:
 
 		# Translating
 		try:
-			translated_formatter = translation_utils.translate_from_dict(self.translations.get(key, {}), language, fallback_language=fallback_language)
+			translated_formatter = translation_utils.translate_from_dict(self.translations.get(key, {}), language, fallback_handler=fallback_handler)
 		except KeyError:
 			try:
-				translated_formatter = translation_utils.translate_from_dict(plugin_translations.get(key, {}), language, fallback_language=fallback_language, default=None)
+				translated_formatter = translation_utils.translate_from_dict(plugin_translations.get(key, {}), language, fallback_handler=fallback_handler, default=None)
 			except KeyError:
 				translated_formatter = None
 
@@ -85,6 +86,6 @@ class TranslationManager:
 			return translated_formatter
 		else:
 			if not allow_failure:
-				raise KeyError('Translation key "{}" not found with language {}, fallback_language {}'.format(key, language, fallback_language))
+				raise KeyError('Translation key "{}" not found with language {}, fallback_language {}'.format(key, language, fallback_handler))
 			self.logger.error('Error translate text "{}" to language {}'.format(key, language))
 			return key if not use_rtext else RTextBase.from_any(key)
